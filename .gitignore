@@ -1,0 +1,14 @@
+# Binaries
+minidocker
+
+# Directories to ignore
+minidocker_state/
+alpine_rootfs/
+
+# Temporary files
+*.tar.gz
+*.log
+
+# OS specific
+.DS_Store
+Thumbs.db
