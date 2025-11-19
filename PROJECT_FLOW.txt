@@ -1,0 +1,528 @@
+PROJECT FLOW AND ARCHITECTURE: MINI DOCKER (COMPLETE END-TO-END WALKTHROUGH)
+
+================================================================================
+                    TABLE OF CONTENTS
+================================================================================
+1. Project Philosophy & Motivation
+2. Complete Setup Process (From Scratch)
+3. Creating the Base Image
+4. Building Custom Images with MiniDockerfile
+5. Running Containers
+6. Container Lifecycle Management
+7. Technical Deep Dive
+8. Command Reference
+
+================================================================================
+1. PROJECT PHILOSOPHY & MOTIVATION
+================================================================================
+You are building "Mini Docker" to demystify container technology.
+
+THE MYTH: Containers are lightweight Virtual Machines.
+THE REALITY: A container is just a normal Linux process with "blinders" on (Namespaces) and "shackles" on (Chroot).
+THE GOAL: To use low-level System Calls (Go `syscall` package) to manually construct this isolated environment, proving that containers are just a feature of the Linux Kernel, not magic.
+
+WHY THIS PROJECT?
+- Educational: Demonstrates OS concepts (processes, syscalls, filesystems) in practice.
+- Transparency: No black boxes. You control every step.
+- WSL Compatible: Works around limitations in Windows Subsystem for Linux.
+
+================================================================================
+2. COMPLETE SETUP PROCESS (FROM SCRATCH)
+================================================================================
+
+STEP 1: Install Prerequisites
+------------------------------
+Command: sudo apt update && sudo apt install golang-go docker.io
+
+Explanation:
+- golang-go: Installs the Go compiler and runtime (required to build minidocker).
+- docker.io: We use Docker temporarily to extract a base Alpine Linux filesystem.
+
+STEP 2: Build the Mini Docker Binary
+------------------------------------
+Command: go build -o minidocker .
+
+What happens:
+1. Go compiler reads main.go, images.go, and build.go.
+2. It compiles them into a single executable named "minidocker".
+3. This binary contains all the logic for creating containers.
+
+File created: ./minidocker (executable)
+
+STEP 3: Create the Base Root Filesystem
+---------------------------------------
+Command: ./setup_rootfs.sh
+
+What the script does (line by line):
+1. `docker pull alpine:latest` - Downloads a minimal Linux distribution (5MB).
+2. `docker create --name temp_alpine alpine` - Creates a container (without starting it).
+3. `docker export temp_alpine > alpine.tar` - Extracts the entire filesystem to a tar file.
+4. `mkdir alpine_rootfs` - Creates a directory to hold the extracted files.
+5. `tar -xvf alpine.tar -C alpine_rootfs` - Extracts the tar into alpine_rootfs.
+6. `docker rm temp_alpine` - Cleans up the temporary container.
+7. `rm alpine.tar` - Deletes the tar file.
+
+Result: You now have `alpine_rootfs/` containing:
+- /bin/sh (the shell)
+- /bin/busybox (minimal Unix tools)
+- /lib/ld-musl-x86_64.so.1 (the dynamic linker for running binaries)
+- /etc/passwd, /etc/hosts (system configuration)
+- Standard Linux directory structure (/home, /tmp, /var, etc.)
+
+STEP 4: Create a Tarball for the Image System
+---------------------------------------------
+Command: sudo tar -C alpine_rootfs -cf alpine-base.tar .
+
+Explanation:
+- We package alpine_rootfs into a single tar file.
+- This allows us to "load" it into the image management system.
+- The `-C alpine_rootfs` means "change directory into alpine_rootfs before creating the tar".
+- The `.` means "include all files in the current directory".
+
+File created: alpine-base.tar
+
+STEP 5: Load the Base Image
+---------------------------
+Command: sudo ./minidocker image load alpine-base.tar
+
+What happens internally (in images.go):
+1. Generate a unique ID (e.g., "bc407c593a19af43") using crypto/rand.
+2. Create directory: `./images/bc407c593a19af43/`.
+3. Extract the tar file into that directory using: `tar -xvf alpine-base.tar -C ./images/bc407c593a19af43/`.
+4. Create a manifest.json file: `{ "id": "bc407c593a19af43", "name": "bc407c593a19af43", "cmd": "" }`.
+5. Update images/index.json to register this image.
+
+Directory created: ./images/bc407c593a19af43/
+Files: Same structure as alpine_rootfs (bin/, lib/, etc.)
+
+STEP 6: Tag the Image with a Friendly Name
+------------------------------------------
+Command: sudo ./minidocker image tag bc407c593a19af43 alpine
+
+What happens:
+1. Program searches images/index.json for ID "bc407c593a19af43".
+2. Updates the "name" field to "alpine".
+3. Saves the updated index.json.
+4. Updates the manifest.json inside images/bc407c593a19af43/.
+
+Result: You can now refer to this image as "alpine" instead of the long ID.
+
+================================================================================
+3. CREATING THE BASE IMAGE (Complete Process)
+================================================================================
+
+Now you have a working base image named "alpine". Let's verify:
+
+Command: sudo ./minidocker image ls
+
+Output:
+IMAGE    ID                 CMD
+alpine   bc407c593a19af43
+
+Explanation: This lists all available images in your local store.
+
+Command: sudo ./minidocker image inspect alpine
+
+Output:
+ID: bc407c593a19af43
+Name: alpine
+CMD: 
+
+Explanation: Shows metadata. CMD is empty because we haven't specified a default command yet.
+
+================================================================================
+4. BUILDING CUSTOM IMAGES WITH MINIDOCKERFILE
+================================================================================
+
+STEP 1: Create Your Application
+-------------------------------
+Let's create a simple "Hello World" application.
+
+Command: mkdir pushpa-app
+Command: cd pushpa-app
+
+Create file: hello.sh
+Content:
+#!/bin/sh
+echo "Hello from Mini Docker!"
+
+Command: chmod +x hello.sh
+
+Explanation: We're creating a shell script that will be packaged into the image.
+
+STEP 2: Write the MiniDockerfile
+--------------------------------
+Create file: MiniDockerfile
+Content:
+FROM alpine
+COPY hello.sh /hello.sh
+CMD /hello.sh
+
+Line-by-line explanation:
+- FROM alpine: Start with the "alpine" base image we created earlier.
+- COPY hello.sh /hello.sh: Copy hello.sh from the build context (current directory) to /hello.sh inside the image.
+- CMD /hello.sh: Set the default command to execute when a container is run.
+
+STEP 3: Build the Image
+-----------------------
+Command: cd ..
+Command: sudo ./minidocker image build ./pushpa-app myhello:latest
+
+What happens internally (build.go - imageBuild function):
+
+1. PARSING PHASE:
+   - Opens ./pushpa-app/MiniDockerfile
+   - Reads line by line using bufio.Scanner
+   - Parses each instruction into a structure
+
+2. BASE IMAGE RESOLUTION (FROM alpine):
+   - Calls findImageDirByName("alpine")
+   - Searches images/index.json for "alpine"
+   - Finds: ./images/bc407c593a19af43
+
+3. IMAGE DIRECTORY CREATION:
+   - Generates new ID: "b27886daa66917b4" (example)
+   - Creates: ./images/b27886daa66917b4/
+
+4. BASE LAYER CLONING (The Hardlink Magic):
+   Command executed: cp -al ./images/bc407c593a19af43/. ./images/b27886daa66917b4/
+   
+   What -al means:
+   - -a: Archive mode (preserves permissions, timestamps)
+   - -l: Create hardlinks instead of copying
+   
+   Result: Every file in the new image points to the same disk blocks as the base.
+   - /bin/sh in myhello points to the SAME physical data as /bin/sh in alpine.
+   - Uses virtually 0 extra disk space.
+   - Instant operation (no data copying).
+
+5. COPY INSTRUCTION PROCESSING (COPY hello.sh /hello.sh):
+   Command executed: cp -a ./pushpa-app/hello.sh ./images/b27886daa66917b4/hello.sh
+   
+   Result: hello.sh is now in the image root.
+   - This is a REAL copy (not a hardlink) because the source is outside the image system.
+
+6. MANIFEST CREATION:
+   Creates: ./images/b27886daa66917b4/manifest.json
+   Content:
+   {
+     "id": "b27886daa66917b4",
+     "name": "myhello:latest",
+     "cmd": "/hello.sh"
+   }
+
+7. INDEX REGISTRATION:
+   Updates: ./images/index.json
+   Adds entry: { "id": "b27886daa66917b4", "name": "myhello:latest", "cmd": "/hello.sh" }
+
+Output: Built image myhello:latest with ID b27886daa66917b4
+
+Final directory structure:
+./images/b27886daa66917b4/
+├── bin/ (hardlinked from alpine)
+├── lib/ (hardlinked from alpine)
+├── etc/ (hardlinked from alpine)
+├── hello.sh (NEW - actual copy)
+└── manifest.json (NEW)
+
+================================================================================
+5. RUNNING CONTAINERS (The Complete Runtime Flow)
+================================================================================
+
+Command: sudo ./minidocker run --image myhello:latest
+
+PHASE A: PREPARATION (In main.go - run() function)
+--------------------------------------------------
+
+Step 1: Argument Parsing
+- Detects "--image" flag
+- Extracts image name: "myhello:latest"
+
+Step 2: Image Resolution
+- Calls loadImageByName("myhello:latest")
+- Searches images/index.json (reverse order to get newest)
+- Finds ID: b27886daa66917b4
+- Retrieves CMD: "/hello.sh"
+
+Step 3: Container Rootfs Creation (in images.go - cloneImageRootfs)
+-------------------------------------------------------------------
+Action sequence:
+1. Generate container ID: "aeed037843a82114" (random)
+2. Create directory: ./containers/aeed037843a82114/
+3. Execute: cp -al ./images/b27886daa66917b4/. ./containers/aeed037843a82114/
+
+Result: Container has its own copy (via hardlinks) of the entire filesystem.
+- Changes made in the container won't affect the image.
+- Multiple containers can share the same image with minimal disk usage.
+
+PHASE B: NAMESPACE ISOLATION (The Parent Process)
+-------------------------------------------------
+
+Step 1: Prepare Re-execution Command
+Code: cmdArgs := []string{"child", "containers/aeed037843a82114", "/hello.sh"}
+Code: cmd := exec.Command("/proc/self/exe", cmdArgs...)
+
+Explanation:
+- /proc/self/exe is a symlink to the current executable (minidocker itself).
+- We're running minidocker again, but with "child" as the first argument.
+- This new process will be isolated.
+
+Step 2: Configure Namespaces
+Code:
+cmd.SysProcAttr = &syscall.SysProcAttr{
+    Cloneflags: syscall.CLONE_NEWUTS | 
+                syscall.CLONE_NEWPID | 
+                syscall.CLONE_NEWNS | 
+                syscall.CLONE_NEWIPC,
+}
+
+Each flag explained:
+- CLONE_NEWUTS: New UTS namespace (hostname isolation)
+  * The container can set its own hostname without affecting the host.
+  
+- CLONE_NEWPID: New PID namespace (process ID isolation)
+  * The first process in the container becomes PID 1.
+  * The container cannot see or signal host processes.
+  
+- CLONE_NEWNS: New Mount namespace (filesystem mount isolation)
+  * The container can mount filesystems (like /proc) without affecting the host.
+  
+- CLONE_NEWIPC: New IPC namespace (inter-process communication isolation)
+  * Shared memory segments are isolated from the host.
+
+Step 3: Launch the Child Process
+Code: cmd.Start()
+
+Low-level operation: The Go runtime calls the Linux `clone()` syscall with those flags.
+Result: A new process is created with isolated namespaces.
+- On the host: It appears as PID 10725 (example).
+- Inside the container: It will see itself as PID 1.
+
+Step 4: State Tracking
+Code: saveContainerState(cmd.Process.Pid, "/hello.sh")
+
+Action: Creates file ./minidocker_state/10725 containing "/hello.sh"
+Purpose: Allows `minidocker ps` to list running containers.
+
+Step 5: Wait
+Code: cmd.Wait()
+
+Explanation: The parent process blocks here until the container exits.
+
+PHASE C: CONTAINER INITIALIZATION (The Child Process - main.go child() function)
+-------------------------------------------------------------------------------
+The minidocker binary starts again. This time os.Args[1] is "child", so it calls the child() function.
+
+IMPORTANT: This code runs INSIDE the isolated namespaces.
+
+Step 1: Hostname Isolation
+---------------------------
+Code: syscall.Sethostname([]byte("minidocker"))
+
+System call: sethostname("minidocker", 10)
+
+Result:
+- Inside container: `hostname` command returns "minidocker"
+- On host: `hostname` still returns your original hostname (e.g., "NooB")
+
+Step 2: Filesystem Jail (Chroot)
+--------------------------------
+Code: syscall.Chroot("containers/aeed037843a82114")
+Code: syscall.Chdir("/")
+
+System calls:
+- chroot("containers/aeed037843a82114")
+- chdir("/")
+
+What happens:
+1. The kernel changes this process's root directory pointer from the real "/" to "./containers/aeed037843a82114".
+2. Any file path like "/bin/sh" now resolves to "./containers/aeed037843a82114/bin/sh" on the host.
+3. The process CANNOT access anything outside this directory tree, even with "../../../".
+
+Security implication: The container cannot read /etc/passwd from the host or delete host files.
+
+Step 3: Mounting /proc
+----------------------
+Code: syscall.Mount("proc", "/proc", "proc", 0, "")
+
+System call: mount("proc", "/proc", "proc", MS_MGC_VAL, NULL)
+
+Explanation:
+- /proc is a pseudo-filesystem provided by the kernel.
+- It exposes process information (PIDs, memory maps, file descriptors).
+- Because we're in a new PID namespace, we need to mount a NEW /proc that only shows processes in our namespace.
+
+Before mount: `ls /proc` would fail or be empty.
+After mount: `ls /proc` shows "1" (our process).
+
+Why needed: Tools like `ps`, `top`, and `kill` read from /proc.
+
+Step 4: Finding the Command
+---------------------------
+Code: cmdPath, err := exec.LookPath(command)
+
+What it does:
+- Searches for the command in the PATH environment variable.
+- For "/hello.sh", it will use the path directly (absolute path).
+- For "sh", it would search /bin, /usr/bin, etc.
+
+Result: cmdPath = "/hello.sh"
+
+Step 5: Execution (The Handoff to User Code)
+--------------------------------------------
+Code: syscall.Exec(cmdPath, append([]string{command}, args...), os.Environ())
+
+System call: execve("/hello.sh", ["/hello.sh"], [environ])
+
+What happens:
+1. The kernel REPLACES the current process image (the Go binary) with the new program (/hello.sh).
+2. The PID stays the same (PID 1 in the container).
+3. The Go runtime is gone. All Go code stops executing.
+4. The new process (hello.sh) starts from its entry point (#!/bin/sh).
+
+Memory layout before exec:
+[Go runtime] [main.go code] [syscall library]
+
+Memory layout after exec:
+[/bin/sh interpreter] [hello.sh script]
+
+Output to stdout: "Hello from Mini Docker!"
+
+The container is now fully alive, running user code.
+
+PHASE D: CONTAINER EXECUTION & CLEANUP
+--------------------------------------
+
+What's happening now:
+- The parent process (minidocker) is waiting in cmd.Wait().
+- The child process is running /hello.sh.
+- /hello.sh executes and prints "Hello from Mini Docker!".
+- /hello.sh finishes and exits with code 0.
+
+When the child exits:
+1. The kernel sends a SIGCHLD signal to the parent.
+2. cmd.Wait() returns.
+3. Parent executes: removeContainerState(10725)
+   - Deletes: ./minidocker_state/10725
+4. Parent prints: "Container 10725 stopped"
+5. Parent exits.
+
+Result: The container is destroyed. The rootfs remains in ./containers/aeed037843a82114/ but is no longer active.
+
+================================================================================
+6. CONTAINER LIFECYCLE MANAGEMENT
+================================================================================
+
+Listing Running Containers
+---------------------------
+Command: sudo ./minidocker ps
+
+What it does (main.go - ps() function):
+1. Lists files in ./minidocker_state/
+2. For each file (e.g., "10725"), reads its content ("/hello.sh")
+3. Prints: "PID    COMMAND"
+            "10725  /hello.sh"
+
+Stopping a Container
+--------------------
+Command: sudo ./minidocker stop 10725
+
+What it does (main.go - stop() function):
+1. Parses "10725" as an integer.
+2. Calls: syscall.Kill(10725, syscall.SIGTERM)
+   - System call: kill(10725, SIGTERM)
+   - Sends signal 15 (termination request) to PID 10725.
+3. The container process receives the signal and exits gracefully.
+
+Output: "Sent SIGTERM to container 10725"
+
+Entering a Running Container
+-----------------------------
+Command: sudo ./minidocker exec 10725 /bin/sh
+
+What it does (main.go - execCmd() function):
+1. Prepares: nsenter -t 10725 -m -u -i -p /bin/sh
+2. Executes nsenter (a Linux utility).
+
+nsenter flags:
+- -t 10725: Target PID 10725
+- -m: Enter mount namespace
+- -u: Enter UTS namespace
+- -i: Enter IPC namespace
+- -p: Enter PID namespace
+
+Result: You get a shell INSIDE the running container, sharing its isolated view.
+
+================================================================================
+7. TECHNICAL DEEP DIVE
+================================================================================
+
+The Hardlink Strategy
+---------------------
+Question: Why use hardlinks instead of copying files?
+
+Answer:
+- A hardlink is a directory entry pointing to an inode (the actual file data).
+- When you create a hardlink, you're creating a new name for the same data.
+- The data is only deleted when ALL hardlinks are removed (reference counting).
+
+Example:
+File: images/alpine/bin/sh (inode 12345)
+After: cp -al images/alpine/. images/myhello/
+Result: images/myhello/bin/sh (also inode 12345)
+
+Disk usage: 0 bytes extra.
+Speed: Instant (just updating directory metadata).
+
+The Re-execution Pattern
+------------------------
+Question: Why does minidocker run itself with "child"?
+
+Answer:
+- The `clone()` syscall only affects child processes.
+- We can't apply namespaces to our current process.
+- Solution: Fork (via exec.Command) and apply namespaces to the child.
+- By re-executing ourselves, we can write all the container logic in the same codebase.
+
+The /proc Filesystem
+-------------------
+Question: What is /proc and why mount it?
+
+Answer:
+- /proc is not a real disk filesystem.
+- It's a kernel interface exposed as files.
+- Reading /proc/1/status reads kernel memory structures about process 1.
+- Each PID namespace has its own view of /proc.
+- Without mounting it, the container would have an empty /proc.
+
+================================================================================
+8. COMPLETE COMMAND REFERENCE
+================================================================================
+
+Building & Setup:
+-----------------
+go build -o minidocker .                       # Compile the binary
+./setup_rootfs.sh                              # Create base filesystem
+sudo tar -C alpine_rootfs -cf alpine.tar .    # Create image tarball
+sudo ./minidocker image load alpine.tar       # Import to image store
+sudo ./minidocker image tag <id> alpine       # Name the image
+
+Image Management:
+----------------
+sudo ./minidocker image ls                            # List all images
+sudo ./minidocker image build <context> <name>        # Build from MiniDockerfile
+sudo ./minidocker image inspect <name>                # Show image details
+sudo ./minidocker image save <name> <file.tar>        # Export image
+sudo ./minidocker image tag <id> <new-name>           # Rename/tag image
+
+Container Operations:
+--------------------
+sudo ./minidocker run --image <name> [cmd]     # Start a container
+sudo ./minidocker run --image alpine /bin/sh   # Interactive shell
+sudo ./minidocker ps                            # List running containers
+sudo ./minidocker exec <pid> <cmd>              # Execute in running container
+sudo ./minidocker stop <pid>                    # Stop a container
+
+================================================================================
+                            END OF DOCUMENT
+================================================================================
