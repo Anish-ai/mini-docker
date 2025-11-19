@@ -4,8 +4,11 @@ minidocker
 # Directories to ignore
 minidocker_state/
 alpine_rootfs/
+containers/
+images/
 
 # Temporary files
+*.tar
 *.tar.gz
 *.log
 

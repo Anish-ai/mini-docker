@@ -4,18 +4,16 @@
 
 **Mini Docker** is a lightweight, educational container runtime built from scratch in Go. It is designed to demonstrate the fundamental operating system concepts that power modern container engines like Docker, Kubernetes, and Podman.
 
-Unlike full-scale container engines, this project focuses on simplicity and readability. It strips away complex networking, image layering, and resource quotas to focus on the core mechanism: **Process Isolation**.
+Unlike full-scale container engines, this project focuses on simplicity and readability. It strips away complex networking and resource quotas to focus on the core mechanisms: **Process Isolation** and **Image Management**.
 
 **Special Note on Environment:**
-This project is specifically tailored to run inside **WSL (Windows Subsystem for Linux)**. Standard container runtimes often rely on features like `cgroups` (Control Groups) and `overlayfs` (Overlay Filesystems) which can be problematic or unsupported in basic WSL setups. Mini Docker works around these limitations to provide a functional "container-like" experience on Windows.
+This project is specifically tailored to run inside **WSL (Windows Subsystem for Linux)**. Standard container runtimes often rely on features like `cgroups` (Control Groups) and `overlayfs` (Overlay Filesystems) which can be problematic or unsupported in basic WSL setups. Mini Docker works around these limitations to provide a functional "container-like" experience on Windows using standard Linux primitives.
 
 ---
 
-## 2. What is a Container? (The Theory)
+## 2. Core Concepts (The Theory)
 
-To understand what we are building, we must understand what a container actually *is*.
-
-A container is **not** a real physical object or a virtual machine. It is a **process** on your computer that has been tricked into believing it is the only process running on a separate machine.
+To understand what we are building, we must understand what a container actually *is*. It is **not** a virtual machine. It is a **process** on your computer that has been tricked into believing it is the only process running on a separate machine.
 
 We achieve this "trick" using Linux Kernel features:
 
@@ -29,11 +27,15 @@ Namespaces determine **what a process can see**.
 ### B. Chroot (Filesystem Isolation)
 `chroot` (Change Root) changes the root directory (`/`) for a process.
 -   Normally, your root is `/`.
--   In Mini Docker, we tell the process: "Your root is now `/home/user/project/minidocker/alpine_rootfs`".
+-   In Mini Docker, we tell the process: "Your root is now `/home/user/project/minidocker/containers/<id>`".
 -   The process cannot see or access anything outside that folder.
 
-### C. Cgroups (Resource Control) - *Omitted*
-Real Docker uses Control Groups to say "This process can only use 50% CPU". We have omitted this for WSL compatibility and simplicity.
+### C. Image Layering (Hardlinks)
+Real Docker uses `overlayfs` to layer images. Since WSL support for overlayfs can be tricky, we use **Hardlinks** (`cp -al`).
+-   **Images** are stored as read-only templates in `./images/`.
+-   **Containers** are created by recursively hardlinking the image files to `./containers/<id>/`.
+-   This is fast and saves space (files share the same disk inode).
+-   If a container modifies a file, the hardlink is broken (Copy-on-Write behavior is emulated via file replacement or explicit copy).
 
 ---
 
@@ -43,92 +45,130 @@ The project is organized as follows:
 
 ```text
 minidocker/
-├── main.go             # The Source Code (The Brain)
-├── setup_rootfs.sh     # The Setup Script (The Builder)
-├── alpine_rootfs/      # The Root Filesystem (The Body)
-├── minidocker_state/   # State Directory (The Memory)
-├── .gitignore          # Git Configuration
-└── README.md           # Quick Start Guide
-```
-
-### `main.go`
-This is the single Go file containing all logic. It handles:
-1.  **CLI Parsing:** Reading commands like `run`, `exec`, `stop`.
-2.  **Namespace Creation:** Using `syscall.SysProcAttr` to create new Linux namespaces.
-3.  **Container Initialization:** The "child" process that sets up the environment (hostname, chroot, proc mount).
-
-### `setup_rootfs.sh`
-A bash script that downloads a minimal Alpine Linux distribution (about 5MB). This folder acts as the "hard drive" for our containers.
-
-### `minidocker_state/`
-A directory where we store the Process IDs (PIDs) of running containers. This allows commands like `ps` and `stop` to know which processes are containers.
-
----
-
-## 4. How It Works: The Lifecycle of a Container
-
-When you run `sudo ./minidocker run alpine_rootfs /bin/sh`, the following happens:
-
-### Step 1: The Parent (CLI)
-1.  The program starts.
-2.  It parses the arguments.
-3.  It prepares to run **itself** again, but this time with special flags:
-    -   `CLONE_NEWUTS`
-    -   `CLONE_NEWPID`
-    -   `CLONE_NEWNS`
-4.  It calls `/proc/self/exe child ...`. This is a trick called **re-execution**.
-
-### Step 2: The Child (Container Init)
-1.  The new process starts. Because of the flags, it is now in a new "world" (Namespace).
-2.  **Hostname:** It sets the hostname to `minidocker`.
-3.  **Chroot:** It changes its root directory to `alpine_rootfs`.
-4.  **Directory Change:** It moves into the new `/`.
-5.  **Mount /proc:** It mounts the special `proc` filesystem so tools like `ps` work inside.
-6.  **Exec:** Finally, it replaces itself with the user's command (e.g., `/bin/sh`).
-
-### Step 3: The Running Container
-The user is now interacting with `/bin/sh` inside the isolated environment.
-
----
-
-## 5. Key Functions Explained
-
-### `run()`
-Sets up the namespaces.
-```go
-cmd.SysProcAttr = &syscall.SysProcAttr{
-    Cloneflags: syscall.CLONE_NEWUTS | syscall.CLONE_NEWPID | ...
-}
-```
-
-### `child()`
-Configures the inside of the container.
-```go
-syscall.Sethostname([]byte("minidocker"))
-syscall.Chroot(rootfs)
-syscall.Mount("proc", "/proc", "proc", 0, "")
-```
-
-### `execCmd()`
-Allows entering an existing container using `nsenter`.
-`nsenter` is a Linux tool that lets a process "jump" into the namespaces of another process.
-```go
-// Enters the Mount, UTS, IPC, and PID namespaces of the target PID
-exec.Command("nsenter", "-t", pid, "-m", "-u", "-i", "-p", command)
+├── main.go             # Entry point and CLI dispatch
+├── images.go           # Image management logic (load, save, tag, inspect)
+├── build.go            # MiniDockerfile parser and builder
+├── setup_rootfs.sh     # Script to download base Alpine rootfs
+├── images/             # Storage for image templates (read-only)
+├── containers/         # Runtime storage for active containers (read-write)
+├── minidocker_state/   # Stores PIDs of running containers
+├── pushpa-app/         # Example user application
+│   ├── MiniDockerfile  # Build definition
+│   └── hello.sh        # Application script
+└── DOCUMENTATION.md    # This file
 ```
 
 ---
 
-## 6. Future Improvements
+## 4. Command Reference
 
-If you wanted to expand this project into a "Real" Docker, you would add:
-1.  **Cgroups:** To limit memory and CPU usage.
-2.  **OverlayFS:** To allow multiple containers to share the same base image without copying files.
-3.  **Network Namespaces:** To give each container its own IP address (requires creating virtual ethernet bridges).
-4.  **Image Registry:** A way to pull images from Docker Hub instead of using a local folder.
+All commands must be run with `sudo` as they require root privileges for namespaces and chroot.
+
+### Container Lifecycle
+
+| Command | Usage | Description |
+|---------|-------|-------------|
+| **run** | `minidocker run --image <name> [cmd]` | Creates and starts a new container from an image. |
+| **exec** | `minidocker exec <pid> <cmd>` | Runs a command inside an *existing* running container. |
+| **ps** | `minidocker ps` | Lists all currently running containers and their PIDs. |
+| **stop** | `minidocker stop <pid>` | Sends SIGTERM to stop a running container. |
+
+**Examples:**
+```bash
+# Run a container from the 'alpine' image
+sudo ./minidocker run --image alpine /bin/sh
+
+# Run a custom image
+sudo ./minidocker run --image myhello:latest
+```
+
+### Image Management
+
+| Command | Usage | Description |
+|---------|-------|-------------|
+| **build** | `minidocker image build <dir> <name>` | Builds an image from a `MiniDockerfile`. |
+| **ls** | `minidocker image ls` | Lists all local images. |
+| **tag** | `minidocker image tag <id> <name>` | Assigns a name (tag) to an image ID. |
+| **inspect** | `minidocker image inspect <name>` | Shows image metadata and checks for validity. |
+| **save** | `minidocker image save <name> <file>` | Exports an image to a `.tar` archive. |
+| **load** | `minidocker image load <file>` | Imports an image from a `.tar` archive. |
+
+**Examples:**
+```bash
+# Build an image
+sudo ./minidocker image build ./pushpa-app my-app:v1
+
+# Save an image to share it
+sudo ./minidocker image save my-app:v1 my-app.tar
+
+# Load an image on another machine
+sudo ./minidocker image load my-app.tar
+```
 
 ---
 
-## 7. Conclusion
+## 5. MiniDockerfile Reference
+
+Mini Docker supports a simplified Dockerfile syntax called `MiniDockerfile`.
+
+| Instruction | Description | Example |
+|-------------|-------------|---------|
+| **FROM** | The base image to start from. Must be the first line. | `FROM alpine` |
+| **COPY** | Copies files from the host (build context) to the image. | `COPY hello.sh /bin/hello.sh` |
+| **CMD** | The default command to run if none is specified at runtime. | `CMD /bin/hello.sh` |
+
+**Example `MiniDockerfile`:**
+```dockerfile
+FROM alpine
+COPY hello.sh /hello.sh
+CMD /hello.sh
+```
+
+---
+
+## 6. Technical Implementation Details
+
+### The Build Process
+1.  **Parse**: The `MiniDockerfile` is read line-by-line.
+2.  **Base**: If `FROM alpine` is specified, the system looks for an image named `alpine` in `./images/`.
+3.  **Clone**: The base image is copied (via hardlinks) to a new temporary image directory.
+4.  **Copy**: Files specified in `COPY` are copied from the host into the new image directory.
+5.  **Commit**: A `manifest.json` is written with the new ID and `CMD`. The image is registered in `images/index.json`.
+
+### The Run Process
+1.  **Clone**: The specified image is cloned from `./images/<id>` to `./containers/<new_id>` using hardlinks. This creates the container's "Root Filesystem".
+2.  **Isolate**: The process re-executes itself with `CLONE_NEWPID`, `CLONE_NEWUTS`, etc.
+3.  **Setup**:
+    *   Hostname is set to `minidocker`.
+    *   `chroot` is called to lock the process into `./containers/<new_id>`.
+    *   `/proc` is mounted.
+4.  **Execute**: The user's command (or the image's `CMD`) replaces the init process.
+
+---
+
+## 7. Tech Stack
+
+*   **Language**: Go (Golang) 1.21+
+    *   Chosen for its strong system programming capabilities and direct access to syscalls.
+*   **Operating System**: Linux (Ubuntu via WSL2)
+    *   Relies on Linux-specific kernel features (Namespaces, Chroot).
+*   **Data Format**: JSON
+    *   Used for image manifests and the image index.
+*   **Archive Format**: Tar
+    *   Used for saving and loading images (compatible with standard tools).
+
+---
+
+## 8. Future Improvements
+
+To make this a production-grade container engine, we would need:
+1.  **Cgroups**: To limit memory and CPU usage (e.g., "only use 512MB RAM").
+2.  **OverlayFS**: To allow true copy-on-write layering instead of hardlinks.
+3.  **Network Namespaces**: To give each container its own IP address and virtual network interface.
+4.  **Registry Client**: To pull images directly from Docker Hub.
+
+---
+
+## 9. Conclusion
 
 Mini Docker demonstrates that containers are not magic. They are a clever combination of Linux primitives that isolate processes from one another. By building this, you have looked under the hood of the technology that powers the modern cloud.

@@ -33,6 +33,8 @@ func main() {
 	switch os.Args[1] {
 	case "run":
 		run()
+	case "image":
+		imageCmd()
 	case "child":
 		child()
 	case "exec":
@@ -57,6 +59,75 @@ func printUsage() {
 }
 
 func run() {
+	// Support two modes:
+	// - minidocker run <rootfs> <cmd>
+	// - minidocker run --image <name[:tag]> [cmd]
+	if len(os.Args) < 3 {
+		fmt.Println("Usage: minidocker run <rootfs> <command> [args...] OR minidocker run --image <image> [command]")
+		os.Exit(1)
+	}
+
+	// image mode
+	if os.Args[2] == "--image" {
+		if len(os.Args) < 4 {
+			fmt.Println("Usage: minidocker run --image <image> [command]")
+			os.Exit(1)
+		}
+		imageName := os.Args[3]
+		// optional override command
+		var command string
+		var args []string
+		if len(os.Args) >= 5 {
+			command = os.Args[4]
+			args = os.Args[5:]
+		}
+
+		// create a cloned rootfs for the container
+		rootfs, err := cloneImageRootfs(imageName)
+		if err != nil {
+			fmt.Printf("Error preparing image rootfs: %v\n", err)
+			os.Exit(1)
+		}
+
+		// if image has a default command and user didn't override, use it
+		if command == "" {
+			if img, err := loadImageByName(imageName); err == nil {
+				if img.Cmd != "" {
+					command = img.Cmd
+				}
+			}
+		}
+
+		if command == "" {
+			fmt.Println("No command specified and image has no default CMD")
+			os.Exit(1)
+		}
+
+		fmt.Printf("Starting container from image %s using rootfs %s\n", imageName, rootfs)
+
+		cmdArgs := append([]string{"child", rootfs, command}, args...)
+		cmd := exec.Command("/proc/self/exe", cmdArgs...)
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			Cloneflags: syscall.CLONE_NEWUTS | syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWIPC,
+		}
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+
+		if err := cmd.Start(); err != nil {
+			fmt.Printf("Error starting container: %v\n", err)
+			os.Exit(1)
+		}
+
+		saveContainerState(cmd.Process.Pid, command)
+		fmt.Printf("Container started with PID %d\n", cmd.Process.Pid)
+		cmd.Wait()
+		removeContainerState(cmd.Process.Pid)
+		fmt.Printf("Container %d stopped\n", cmd.Process.Pid)
+		return
+	}
+
+	// legacy rootfs mode
 	if len(os.Args) < 4 {
 		fmt.Println("Usage: minidocker run <rootfs> <command> [args...]")
 		os.Exit(1)
@@ -78,7 +149,7 @@ func run() {
 	// CLONE_NEWPID: New PID namespace (child becomes PID 1)
 	// CLONE_NEWNS:  New Mount namespace
 	// CLONE_NEWIPC: New IPC namespace
-	cmd.SysProcAttr = &syscall.SysProcAttr{
+		cmd.SysProcAttr = &syscall.SysProcAttr{
 		Cloneflags: syscall.CLONE_NEWUTS | syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWIPC,
 	}
 
@@ -102,6 +173,96 @@ func run() {
 	removeContainerState(cmd.Process.Pid)
 	fmt.Printf("Container %d stopped\n", cmd.Process.Pid)
 }
+
+// imageCmd handles subcommands for image operations
+func imageCmd() {
+	if len(os.Args) < 3 {
+		fmt.Println("Usage: minidocker image <load|save|ls> ...")
+		os.Exit(1)
+	}
+	switch os.Args[2] {
+	case "build":
+		// Usage: minidocker image build <context-dir> <name>
+		if len(os.Args) != 5 {
+			fmt.Println("Usage: minidocker image build <context-dir> <name>")
+			os.Exit(1)
+		}
+		ctx := os.Args[3]
+		name := os.Args[4]
+		id, err := imageBuild(ctx, name)
+		if err != nil {
+			fmt.Printf("Error building image: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Built image %s with ID %s\n", name, id)
+		return
+	case "load":
+		if len(os.Args) != 4 {
+			fmt.Println("Usage: minidocker image load <file.tar>")
+			os.Exit(1)
+		}
+		file := os.Args[3]
+		id, err := imageLoad(file)
+		if err != nil {
+			fmt.Printf("Error loading image: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Image loaded: %s\n", id)
+	case "tag":
+		// Usage: minidocker image tag <id|name> <new-name>
+		if len(os.Args) != 5 {
+			fmt.Println("Usage: minidocker image tag <id|name> <new-name>")
+			os.Exit(1)
+		}
+		who := os.Args[3]
+		newName := os.Args[4]
+		if err := imageTag(who, newName); err != nil {
+			fmt.Printf("Error tagging image: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Tagged %s as %s\n", who, newName)
+		return
+	case "inspect":
+		if len(os.Args) != 4 {
+			fmt.Println("Usage: minidocker image inspect <id|name>")
+			os.Exit(1)
+		}
+		who := os.Args[3]
+		im, err := imageInspect(who)
+		if err != nil {
+			fmt.Printf("Error inspecting image: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("ID: %s\nName: %s\nCMD: %s\n", im.ID, im.Name, im.Cmd)
+		return
+	case "save":
+		if len(os.Args) != 5 {
+			fmt.Println("Usage: minidocker image save <name> <file.tar>")
+			os.Exit(1)
+		}
+		name := os.Args[3]
+		file := os.Args[4]
+		if err := imageSave(name, file); err != nil {
+			fmt.Printf("Error saving image: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Image %s saved to %s\n", name, file)
+	case "ls":
+		imgs, err := listImages()
+		if err != nil {
+			fmt.Printf("Error listing images: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("IMAGE\tID\tCMD")
+		for _, im := range imgs {
+			fmt.Printf("%s\t%s\t%s\n", im.Name, im.ID, im.Cmd)
+		}
+	default:
+		fmt.Println("Unknown image command")
+		os.Exit(1)
+	}
+}
+
 
 func child() {
 	if len(os.Args) < 4 {
